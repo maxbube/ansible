@@ -10,7 +10,7 @@ DOCUMENTATION = '''
 ---
 module: proxysql_replication_hostgroups
 version_added: "2.3"
-author: "Ben Mildren (@bmildren)"
+author: "Ben Mildren (@bmildren), Max Bubenick (@maxbube)"
 short_description: Manages replication hostgroups using the proxysql admin
                    interface.
 description:
@@ -30,7 +30,13 @@ options:
     required: True
   comment:
     description:
-      - Text field that can be used for any purposes defined by the user.
+      - Text field that can be used for any purposed defined by the user.
+  check_type:
+    description:
+      - Variable checked when executing a read only check. Requires proxysql >= 2.0.1. Otherwise it has no effect.
+    choices: ["read_only", "super_read_only", "innodb_read_only"]
+    default: read_only
+    version_added: 2.9
   state:
     description:
       - When C(present) - adds the replication hostgroup, when C(absent) -
@@ -93,10 +99,10 @@ ANSIBLE_METADATA = {'metadata_version': '1.1',
                     'status': ['stableinterface'],
                     'supported_by': 'community'}
 
-
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.mysql import mysql_connect, mysql_driver, mysql_driver_fail_msg
 from ansible.module_utils._text import to_native
+from distutils.version import LooseVersion
 
 # ===========================================
 # proxysql module specific support methods.
@@ -143,13 +149,16 @@ def load_config_to_runtime(cursor):
 
 class ProxySQLReplicationHostgroup(object):
 
-    def __init__(self, module):
+    def __init__(self, module, proxysql_version):
         self.state = module.params["state"]
         self.save_to_disk = module.params["save_to_disk"]
         self.load_to_runtime = module.params["load_to_runtime"]
         self.writer_hostgroup = module.params["writer_hostgroup"]
         self.reader_hostgroup = module.params["reader_hostgroup"]
         self.comment = module.params["comment"]
+        self.check_type = module.params["check_type"]
+        self.support_check_type = LooseVersion(
+            proxysql_version) >= LooseVersion("2.0.1")
 
     def check_repl_group_config(self, cursor, keys):
         query_string = \
@@ -158,17 +167,20 @@ class ProxySQLReplicationHostgroup(object):
                WHERE writer_hostgroup = %s
                  AND reader_hostgroup = %s"""
 
-        query_data = \
-            [self.writer_hostgroup,
-             self.reader_hostgroup]
+        query_data = [self.writer_hostgroup,
+                      self.reader_hostgroup]
 
         if self.comment and not keys:
             query_string += "\n  AND comment = %s"
             query_data.append(self.comment)
 
+            if self.support_check_type:
+                query_string += " AND check_type = %s"
+                query_data.append(self.check_type)
+
         cursor.execute(query_string, query_data)
         check_count = cursor.fetchone()
-        return (int(check_count['repl_groups']) > 0)
+        return int(check_count['repl_groups']) > 0
 
     def get_repl_group_config(self, cursor):
         query_string = \
@@ -177,41 +189,61 @@ class ProxySQLReplicationHostgroup(object):
                WHERE writer_hostgroup = %s
                  AND reader_hostgroup = %s"""
 
-        query_data = \
-            [self.writer_hostgroup,
-             self.reader_hostgroup]
+        query_data = [self.writer_hostgroup,
+                      self.reader_hostgroup]
 
         cursor.execute(query_string, query_data)
         repl_group = cursor.fetchone()
         return repl_group
 
     def create_repl_group_config(self, cursor):
-        query_string = \
-            """INSERT INTO mysql_replication_hostgroups (
-               writer_hostgroup,
-               reader_hostgroup,
-               comment)
-               VALUES (%s, %s, %s)"""
+        if self.support_check_type:
+            query_string = \
+                """INSERT INTO mysql_replication_hostgroups (
+                writer_hostgroup,
+                reader_hostgroup,
+                comment,
+                check_type)
+                VALUES (%s, %s, %s, %s)"""
 
-        query_data = \
-            [self.writer_hostgroup,
-             self.reader_hostgroup,
-             self.comment or '']
+            query_data = [self.writer_hostgroup,
+                          self.reader_hostgroup,
+                          self.comment or '',
+                          self.check_type]
+        else:
+            query_string = \
+                """INSERT INTO mysql_replication_hostgroups (
+                writer_hostgroup,
+                reader_hostgroup,
+                comment)
+                VALUES (%s, %s, %s)"""
+
+            query_data = [self.writer_hostgroup,
+                          self.reader_hostgroup,
+                          self.comment or '']
 
         cursor.execute(query_string, query_data)
         return True
 
     def update_repl_group_config(self, cursor):
-        query_string = \
-            """UPDATE mysql_replication_hostgroups
-               SET comment = %s
-               WHERE writer_hostgroup = %s
-                 AND reader_hostgroup = %s"""
+        if self.support_check_type:
+            query_string = \
+                """UPDATE mysql_replication_hostgroups
+                SET comment = %s, check_type = %s
+                WHERE writer_hostgroup = %s
+                    AND reader_hostgroup = %s"""
 
-        query_data = \
-            [self.comment,
-             self.writer_hostgroup,
-             self.reader_hostgroup]
+            query_data = [self.comment, self.check_type, self.writer_hostgroup, self.reader_hostgroup]
+        else:
+            query_string = \
+                """UPDATE mysql_replication_hostgroups
+                SET comment = %s
+                WHERE writer_hostgroup = %s
+                    AND reader_hostgroup = %s"""
+
+            query_data = [self.comment,
+                          self.writer_hostgroup,
+                          self.reader_hostgroup]
 
         cursor.execute(query_string, query_data)
         return True
@@ -262,8 +294,8 @@ class ProxySQLReplicationHostgroup(object):
                                result['changed'])
         else:
             result['changed'] = True
-            result['msg'] = ("Repl group would have been updated in" +
-                             " mysql_replication_hostgroups, however" +
+            result['msg'] = ("Replication group would have been updated" +
+                             " in mysql_replication_hostgroups, however" +
                              " check_mode is enabled.")
 
     def delete_repl_group(self, check_mode, result, cursor):
@@ -277,8 +309,8 @@ class ProxySQLReplicationHostgroup(object):
                                result['changed'])
         else:
             result['changed'] = True
-            result['msg'] = ("Repl group would have been deleted from" +
-                             " mysql_replication_hostgroups, however" +
+            result['msg'] = ("Replication group would have been deleted" +
+                             " from mysql_replication_hostgroups, however" +
                              " check_mode is enabled.")
 
 # ===========================================
@@ -298,6 +330,10 @@ def main():
             writer_hostgroup=dict(required=True, type='int'),
             reader_hostgroup=dict(required=True, type='int'),
             comment=dict(type='str'),
+            check_type=dict(default="read_only", type='str', choices=[
+                "read_only",
+                "super_read_only",
+                "innodb_read_only"]),
             state=dict(default='present', choices=['present',
                                                    'absent']),
             save_to_disk=dict(default=True, type='bool'),
@@ -321,13 +357,15 @@ def main():
                                cursor_class=mysql_driver.cursors.DictCursor)
     except mysql_driver.Error as e:
         module.fail_json(
-            msg="unable to connect to ProxySQL Admin Module.. %s" % to_native(e)
+            msg="Unable to connect to ProxySQL Admin Module.. %s" % to_native(e)
         )
+    cursor.execute("select version();")
+    raw_version = cursor.fetchone()
+    proxysql_version = raw_version['version()']
 
-    proxysql_repl_group = ProxySQLReplicationHostgroup(module)
-    result = {}
-
-    result['state'] = proxysql_repl_group.state
+    proxysql_repl_group = ProxySQLReplicationHostgroup(
+        module, proxysql_version)
+    result = {'state': proxysql_repl_group.state}
 
     if proxysql_repl_group.state == "present":
         try:
@@ -344,7 +382,7 @@ def main():
                                                           cursor)
                 else:
                     result['changed'] = False
-                    result['msg'] = ("The repl group already exists in" +
+                    result['msg'] = ("The replication group already exists in" +
                                      " mysql_replication_hostgroups and" +
                                      " doesn't need to be updated.")
                     result['repl_group'] = \
@@ -352,7 +390,7 @@ def main():
 
         except mysql_driver.Error as e:
             module.fail_json(
-                msg="unable to modify replication hostgroup.. %s" % to_native(e)
+                msg="Unable to modify replication hostgroup.. %s" % to_native(e)
             )
 
     elif proxysql_repl_group.state == "absent":
@@ -364,13 +402,13 @@ def main():
                                                       cursor)
             else:
                 result['changed'] = False
-                result['msg'] = ("The repl group is already absent from the" +
-                                 " mysql_replication_hostgroups memory" +
+                result['msg'] = ("The replication group is already absent from" +
+                                 " the mysql_replication_hostgroups memory" +
                                  " configuration")
 
         except mysql_driver.Error as e:
             module.fail_json(
-                msg="unable to delete replication hostgroup.. %s" % to_native(e)
+                msg="Unable to delete replication hostgroup.. %s" % to_native(e)
             )
 
     module.exit_json(**result)
